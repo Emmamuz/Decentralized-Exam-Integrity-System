@@ -10,6 +10,8 @@
 (define-constant ERR_EXAM_NOT_ACTIVE (err u108))
 (define-constant ERR_INVALID_DURATION (err u109))
 (define-constant ERR_ALREADY_REGISTERED (err u110))
+(define-constant ERR_EXAM_PAUSED (err u111))
+(define-constant ERR_INVALID_EXTENSION (err u112))
 
 (define-data-var next-exam-id uint u1)
 (define-data-var total-exams uint u0)
@@ -26,7 +28,10 @@
     duration-blocks: uint,
     max-attempts: uint,
     passing-score: uint,
-    is-active: bool
+    is-active: bool,
+    is-paused: bool,
+    total-pause-time: uint,
+    extension-granted: uint
   })
 
 (define-map exam-registrations
@@ -88,8 +93,9 @@
        (end-block (+ start-block (get duration-blocks exam-data))))
       (and 
         (get is-active exam-data)
+        (not (get is-paused exam-data))
         (>= current-block start-block)
-        (< current-block end-block)))
+        (< current-block (+ end-block (get total-pause-time exam-data) (get extension-granted exam-data)))))
     false))
 
 (define-read-only (get-exam-status (exam-id uint))
@@ -149,7 +155,10 @@
       duration-blocks: duration-blocks,
       max-attempts: max-attempts,
       passing-score: passing-score,
-      is-active: true
+      is-active: true,
+      is-paused: false,
+      total-pause-time: u0,
+      extension-granted: u0
     })
     
     (var-set next-exam-id (+ exam-id u1))
@@ -184,6 +193,7 @@
     
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
     (asserts! (can-submit exam-id tx-sender) ERR_SUBMISSION_PERIOD_ENDED)
+    (asserts! (not (get is-paused (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_EXAM_PAUSED)
     (asserts! (is-none (get-submission exam-id tx-sender current-attempt)) ERR_ALREADY_SUBMITTED)
     
     (map-set submissions
@@ -298,3 +308,59 @@
       (merge (unwrap! exam-data ERR_EXAM_NOT_FOUND) {is-active: false}))
     
     (ok true)))
+
+(define-map pause-timestamps uint uint)
+
+(define-read-only (get-pause-timestamp (exam-id uint))
+  (map-get? pause-timestamps exam-id))
+
+(define-public (pause-exam (exam-id uint))
+  (let
+    ((exam-data (get-exam exam-id)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active (unwrap! exam-data ERR_EXAM_NOT_FOUND)) ERR_EXAM_NOT_ACTIVE)
+    (asserts! (not (get is-paused (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_EXAM_PAUSED)
+    
+    (map-set pause-timestamps exam-id stacks-block-height)
+    (map-set exams exam-id
+      (merge (unwrap! exam-data ERR_EXAM_NOT_FOUND) {is-paused: true}))
+    
+    (ok true)))
+
+(define-public (resume-exam (exam-id uint))
+  (let
+    ((exam-data (get-exam exam-id))
+     (pause-time (get-pause-timestamp exam-id)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-paused (unwrap! exam-data ERR_EXAM_NOT_FOUND)) ERR_EXAM_NOT_ACTIVE)
+    (asserts! (is-some pause-time) ERR_EXAM_NOT_ACTIVE)
+    
+    (let
+      ((pause-duration (- stacks-block-height (unwrap! pause-time ERR_EXAM_NOT_ACTIVE)))
+       (current-pause-time (get total-pause-time (unwrap! exam-data ERR_EXAM_NOT_FOUND))))
+      
+      (map-delete pause-timestamps exam-id)
+      (map-set exams exam-id
+        (merge (unwrap! exam-data ERR_EXAM_NOT_FOUND) 
+          {is-paused: false, total-pause-time: (+ current-pause-time pause-duration)}))
+      
+      (ok pause-duration))))
+
+(define-public (extend-exam-time (exam-id uint) (extension-blocks uint))
+  (let
+    ((exam-data (get-exam exam-id)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (> extension-blocks u0) ERR_INVALID_EXTENSION)
+    (asserts! (<= extension-blocks u1000) ERR_INVALID_EXTENSION)
+    
+    (let
+      ((current-extension (get extension-granted (unwrap! exam-data ERR_EXAM_NOT_FOUND))))
+      
+      (map-set exams exam-id
+        (merge (unwrap! exam-data ERR_EXAM_NOT_FOUND) 
+          {extension-granted: (+ current-extension extension-blocks)}))
+      
+      (ok (+ current-extension extension-blocks)))))
