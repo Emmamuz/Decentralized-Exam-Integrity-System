@@ -12,10 +12,16 @@
 (define-constant ERR_ALREADY_REGISTERED (err u110))
 (define-constant ERR_EXAM_PAUSED (err u111))
 (define-constant ERR_INVALID_EXTENSION (err u112))
+(define-constant ERR_REPORT_NOT_FOUND (err u113))
+(define-constant ERR_INVALID_REPORTER_KEY (err u114))
+(define-constant ERR_DUPLICATE_ANONYMOUS_REPORT (err u115))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u116))
 
 (define-data-var next-exam-id uint u1)
 (define-data-var total-exams uint u0)
 (define-data-var total-submissions uint u0)
+(define-data-var next-report-id uint u1)
+(define-data-var min-reporter-reputation uint u50)
 
 (define-map exams 
   uint 
@@ -68,6 +74,36 @@
     evidence-hash: (buff 32),
     verified: bool,
     reporter: principal
+  })
+
+(define-map anonymous-reports
+  uint
+  {
+    exam-id: uint,
+    reported-student: principal,
+    evidence-hash: (buff 32),
+    reporter-key-hash: (buff 32),
+    reported-at: uint,
+    verification-status: (string-ascii 20),
+    integrity-score: uint,
+    verified-by: (optional principal)
+  })
+
+(define-map reporter-reputation
+  (buff 32)
+  {
+    total-reports: uint,
+    verified-reports: uint,
+    false-reports: uint,
+    reputation-score: uint,
+    last-report-block: uint
+  })
+
+(define-map exam-anonymous-reports
+  {exam-id: uint, reporter-key-hash: (buff 32)}
+  {
+    report-id: uint,
+    duplicate-check: bool
   })
 
 (define-read-only (get-exam (exam-id uint))
@@ -124,11 +160,32 @@
         false)
       false)))
 
+(define-read-only (get-anonymous-report (report-id uint))
+  (map-get? anonymous-reports report-id))
+
+(define-read-only (get-reporter-reputation (reporter-key-hash (buff 32)))
+  (map-get? reporter-reputation reporter-key-hash))
+
+(define-read-only (calculate-integrity-score (reporter-key-hash (buff 32)))
+  (match (get-reporter-reputation reporter-key-hash)
+    rep-data (let
+      ((total (get total-reports rep-data))
+       (verified (get verified-reports rep-data))
+       (false-reports (get false-reports rep-data)))
+      (if (> total u0)
+        (- (* (/ verified total) u100) (* (/ false-reports total) u50))
+        u50))
+    u50))
+
+(define-read-only (can-report-anonymously (reporter-key-hash (buff 32)))
+  (>= (calculate-integrity-score reporter-key-hash) (var-get min-reporter-reputation)))
+
 (define-read-only (get-total-stats)
   {
     total-exams: (var-get total-exams),
     total-submissions: (var-get total-submissions),
-    next-exam-id: (var-get next-exam-id)
+    next-exam-id: (var-get next-exam-id),
+    next-report-id: (var-get next-report-id)
   })
 
 (define-public (create-exam 
@@ -164,6 +221,89 @@
     (var-set next-exam-id (+ exam-id u1))
     (var-set total-exams (+ (var-get total-exams) u1))
     (ok exam-id)))
+
+(define-public (submit-anonymous-report
+  (exam-id uint)
+  (reported-student principal)
+  (evidence-hash (buff 32))
+  (reporter-key-hash (buff 32)))
+  (let
+    ((exam-data (get-exam exam-id))
+     (report-id (var-get next-report-id))
+     (existing-report (map-get? exam-anonymous-reports {exam-id: exam-id, reporter-key-hash: reporter-key-hash})))
+    
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (can-report-anonymously reporter-key-hash) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (is-none existing-report) ERR_DUPLICATE_ANONYMOUS_REPORT)
+    
+    (let
+      ((integrity-score (calculate-integrity-score reporter-key-hash)))
+      
+      (map-set anonymous-reports report-id {
+        exam-id: exam-id,
+        reported-student: reported-student,
+        evidence-hash: evidence-hash,
+        reporter-key-hash: reporter-key-hash,
+        reported-at: stacks-block-height,
+        verification-status: "pending",
+        integrity-score: integrity-score,
+        verified-by: none
+      })
+      
+      (map-set exam-anonymous-reports
+        {exam-id: exam-id, reporter-key-hash: reporter-key-hash}
+        {report-id: report-id, duplicate-check: true})
+      
+      (let
+        ((current-rep (default-to 
+          {total-reports: u0, verified-reports: u0, false-reports: u0, reputation-score: u50, last-report-block: u0}
+          (get-reporter-reputation reporter-key-hash))))
+        
+        (map-set reporter-reputation reporter-key-hash
+          (merge current-rep {
+            total-reports: (+ (get total-reports current-rep) u1),
+            last-report-block: stacks-block-height
+          }))
+        
+        (var-set next-report-id (+ report-id u1))
+        (ok report-id)))))
+
+(define-public (verify-anonymous-report
+  (report-id uint)
+  (is-verified bool))
+  (let
+    ((report (get-anonymous-report report-id))
+     (exam-data (get-exam (get exam-id (unwrap! report ERR_REPORT_NOT_FOUND)))))
+    
+    (asserts! (is-some report) ERR_REPORT_NOT_FOUND)
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    
+    (let
+      ((report-data (unwrap! report ERR_REPORT_NOT_FOUND))
+       (reporter-key (get reporter-key-hash report-data))
+       (current-rep (default-to 
+         {total-reports: u0, verified-reports: u0, false-reports: u0, reputation-score: u50, last-report-block: u0}
+         (get-reporter-reputation reporter-key))))
+      
+      (map-set anonymous-reports report-id
+        (merge report-data {
+          verification-status: (if is-verified "verified" "rejected"),
+          verified-by: (some tx-sender)
+        }))
+      
+      (map-set reporter-reputation reporter-key
+        (merge current-rep {
+          verified-reports: (if is-verified 
+                              (+ (get verified-reports current-rep) u1) 
+                              (get verified-reports current-rep)),
+          false-reports: (if is-verified 
+                           (get false-reports current-rep)
+                           (+ (get false-reports current-rep) u1)),
+          reputation-score: (calculate-integrity-score reporter-key)
+        }))
+      
+      (ok is-verified))))
 
 (define-public (register-for-exam (exam-id uint))
   (let
