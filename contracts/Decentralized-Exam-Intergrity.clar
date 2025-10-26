@@ -16,6 +16,10 @@
 (define-constant ERR_INVALID_REPORTER_KEY (err u114))
 (define-constant ERR_DUPLICATE_ANONYMOUS_REPORT (err u115))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u116))
+(define-constant ERR_DELEGATE_NOT_FOUND (err u117))
+(define-constant ERR_ALREADY_DELEGATED (err u118))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u119))
+(define-constant ERR_INVALID_PERMISSION (err u120))
 
 (define-data-var next-exam-id uint u1)
 (define-data-var total-exams uint u0)
@@ -106,6 +110,18 @@
     duplicate-check: bool
   })
 
+(define-map exam-delegates
+  {exam-id: uint, delegate: principal}
+  {
+    delegated-at: uint,
+    delegator: principal,
+    can-grade: bool,
+    can-verify-reports: bool,
+    can-pause: bool,
+    can-extend: bool,
+    is-active: bool
+  })
+
 (define-read-only (get-exam (exam-id uint))
   (map-get? exams exam-id))
 
@@ -187,6 +203,31 @@
     next-exam-id: (var-get next-exam-id),
     next-report-id: (var-get next-report-id)
   })
+
+(define-read-only (get-delegate (exam-id uint) (delegate principal))
+  (map-get? exam-delegates {exam-id: exam-id, delegate: delegate}))
+
+(define-read-only (is-authorized (exam-id uint) (caller principal) (permission (string-ascii 20)))
+  (let
+    ((exam-data (get-exam exam-id))
+     (delegate-data (get-delegate exam-id caller)))
+    (match exam-data
+      exam (or
+        (is-eq caller (get creator exam))
+        (match delegate-data
+          delegate (and
+            (get is-active delegate)
+            (if (is-eq permission "grade")
+              (get can-grade delegate)
+              (if (is-eq permission "verify")
+                (get can-verify-reports delegate)
+                (if (is-eq permission "pause")
+                  (get can-pause delegate)
+                  (if (is-eq permission "extend")
+                    (get can-extend delegate)
+                    false)))))
+          false))
+      false)))
 
 (define-public (create-exam 
   (title (string-ascii 128))
@@ -277,7 +318,7 @@
     
     (asserts! (is-some report) ERR_REPORT_NOT_FOUND)
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized (get exam-id (unwrap! report ERR_REPORT_NOT_FOUND)) tx-sender "verify") ERR_NOT_AUTHORIZED)
     
     (let
       ((report-data (unwrap! report ERR_REPORT_NOT_FOUND))
@@ -365,7 +406,7 @@
     
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
     (asserts! (is-some submission) ERR_STUDENT_NOT_REGISTERED)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized exam-id tx-sender "grade") ERR_NOT_AUTHORIZED)
     (asserts! (<= score u100) ERR_INVALID_HASH)
     
     (map-set submissions
@@ -421,7 +462,7 @@
     
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
     (asserts! (is-some report) ERR_STUDENT_NOT_REGISTERED)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized exam-id tx-sender "verify") ERR_NOT_AUTHORIZED)
     
     (map-set cheating-reports
       {exam-id: exam-id, student: student}
@@ -458,7 +499,7 @@
   (let
     ((exam-data (get-exam exam-id)))
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized exam-id tx-sender "pause") ERR_NOT_AUTHORIZED)
     (asserts! (get is-active (unwrap! exam-data ERR_EXAM_NOT_FOUND)) ERR_EXAM_NOT_ACTIVE)
     (asserts! (not (get is-paused (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_EXAM_PAUSED)
     
@@ -473,7 +514,7 @@
     ((exam-data (get-exam exam-id))
      (pause-time (get-pause-timestamp exam-id)))
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized exam-id tx-sender "pause") ERR_NOT_AUTHORIZED)
     (asserts! (get is-paused (unwrap! exam-data ERR_EXAM_NOT_FOUND)) ERR_EXAM_NOT_ACTIVE)
     (asserts! (is-some pause-time) ERR_EXAM_NOT_ACTIVE)
     
@@ -492,7 +533,7 @@
   (let
     ((exam-data (get-exam exam-id)))
     (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
-    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-authorized exam-id tx-sender "extend") ERR_NOT_AUTHORIZED)
     (asserts! (> extension-blocks u0) ERR_INVALID_EXTENSION)
     (asserts! (<= extension-blocks u1000) ERR_INVALID_EXTENSION)
     
@@ -504,3 +545,71 @@
           {extension-granted: (+ current-extension extension-blocks)}))
       
       (ok (+ current-extension extension-blocks)))))
+
+(define-public (delegate-permissions
+  (exam-id uint)
+  (delegate principal)
+  (can-grade bool)
+  (can-verify-reports bool)
+  (can-pause bool)
+  (can-extend bool))
+  (let
+    ((exam-data (get-exam exam-id))
+     (existing-delegate (get-delegate exam-id delegate)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq delegate tx-sender)) ERR_CANNOT_DELEGATE_TO_SELF)
+    (asserts! (is-none existing-delegate) ERR_ALREADY_DELEGATED)
+    (asserts! (or can-grade (or can-verify-reports (or can-pause can-extend))) ERR_INVALID_PERMISSION)
+    
+    (map-set exam-delegates
+      {exam-id: exam-id, delegate: delegate}
+      {
+        delegated-at: stacks-block-height,
+        delegator: tx-sender,
+        can-grade: can-grade,
+        can-verify-reports: can-verify-reports,
+        can-pause: can-pause,
+        can-extend: can-extend,
+        is-active: true
+      })
+    (ok true)))
+
+(define-public (revoke-delegation (exam-id uint) (delegate principal))
+  (let
+    ((exam-data (get-exam exam-id))
+     (delegate-data (get-delegate exam-id delegate)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some delegate-data) ERR_DELEGATE_NOT_FOUND)
+    
+    (map-set exam-delegates
+      {exam-id: exam-id, delegate: delegate}
+      (merge (unwrap! delegate-data ERR_DELEGATE_NOT_FOUND) {is-active: false}))
+    (ok true)))
+
+(define-public (update-delegate-permissions
+  (exam-id uint)
+  (delegate principal)
+  (can-grade bool)
+  (can-verify-reports bool)
+  (can-pause bool)
+  (can-extend bool))
+  (let
+    ((exam-data (get-exam exam-id))
+     (delegate-data (get-delegate exam-id delegate)))
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some delegate-data) ERR_DELEGATE_NOT_FOUND)
+    (asserts! (get is-active (unwrap! delegate-data ERR_DELEGATE_NOT_FOUND)) ERR_DELEGATE_NOT_FOUND)
+    (asserts! (or can-grade (or can-verify-reports (or can-pause can-extend))) ERR_INVALID_PERMISSION)
+    
+    (map-set exam-delegates
+      {exam-id: exam-id, delegate: delegate}
+      (merge (unwrap! delegate-data ERR_DELEGATE_NOT_FOUND) {
+        can-grade: can-grade,
+        can-verify-reports: can-verify-reports,
+        can-pause: can-pause,
+        can-extend: can-extend
+      }))
+    (ok true)))
