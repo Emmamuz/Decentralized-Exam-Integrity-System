@@ -20,12 +20,17 @@
 (define-constant ERR_ALREADY_DELEGATED (err u118))
 (define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u119))
 (define-constant ERR_INVALID_PERMISSION (err u120))
+(define-constant ERR_NOT_PASSED (err u121))
+(define-constant ERR_CERTIFICATE_EXISTS (err u122))
+(define-constant ERR_CERTIFICATE_REVOKED (err u123))
+(define-constant ERR_CERTIFICATE_NOT_FOUND (err u124))
 
 (define-data-var next-exam-id uint u1)
 (define-data-var total-exams uint u0)
 (define-data-var total-submissions uint u0)
 (define-data-var next-report-id uint u1)
 (define-data-var min-reporter-reputation uint u50)
+(define-data-var next-certificate-id uint u1)
 
 (define-map exams 
   uint 
@@ -122,6 +127,24 @@
     is-active: bool
   })
 
+(define-map certificates
+  uint
+  {
+    exam-id: uint,
+    student: principal,
+    issued-at: uint,
+    score: uint,
+    certificate-hash: (buff 32),
+    issuer: principal,
+    is-revoked: bool
+  })
+
+(define-map student-certificates
+  {exam-id: uint, student: principal}
+  {
+    certificate-id: uint
+  })
+
 (define-read-only (get-exam (exam-id uint))
   (map-get? exams exam-id))
 
@@ -201,8 +224,22 @@
     total-exams: (var-get total-exams),
     total-submissions: (var-get total-submissions),
     next-exam-id: (var-get next-exam-id),
-    next-report-id: (var-get next-report-id)
+    next-report-id: (var-get next-report-id),
+    next-certificate-id: (var-get next-certificate-id)
   })
+
+(define-read-only (get-certificate (certificate-id uint))
+  (map-get? certificates certificate-id))
+
+(define-read-only (get-student-certificate (exam-id uint) (student principal))
+  (map-get? student-certificates {exam-id: exam-id, student: student}))
+
+(define-read-only (verify-certificate (certificate-id uint) (certificate-hash (buff 32)))
+  (match (get-certificate certificate-id)
+    cert (and
+      (not (get is-revoked cert))
+      (is-eq (get certificate-hash cert) certificate-hash))
+    false))
 
 (define-read-only (get-delegate (exam-id uint) (delegate principal))
   (map-get? exam-delegates {exam-id: exam-id, delegate: delegate}))
@@ -612,4 +649,53 @@
         can-pause: can-pause,
         can-extend: can-extend
       }))
+    (ok true)))
+
+(define-public (issue-certificate
+  (exam-id uint)
+  (student principal)
+  (certificate-hash (buff 32)))
+  (let
+    ((exam-data (get-exam exam-id))
+     (result-data (get-result exam-id student))
+     (existing-cert (get-student-certificate exam-id student))
+     (certificate-id (var-get next-certificate-id)))
+    
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some result-data) ERR_STUDENT_NOT_REGISTERED)
+    (asserts! (get passed (unwrap! result-data ERR_STUDENT_NOT_REGISTERED)) ERR_NOT_PASSED)
+    (asserts! (is-none existing-cert) ERR_CERTIFICATE_EXISTS)
+    
+    (map-set certificates certificate-id {
+      exam-id: exam-id,
+      student: student,
+      issued-at: stacks-block-height,
+      score: (get best-score (unwrap! result-data ERR_STUDENT_NOT_REGISTERED)),
+      certificate-hash: certificate-hash,
+      issuer: tx-sender,
+      is-revoked: false
+    })
+    
+    (map-set student-certificates
+      {exam-id: exam-id, student: student}
+      {certificate-id: certificate-id})
+    
+    (var-set next-certificate-id (+ certificate-id u1))
+    (ok certificate-id)))
+
+(define-public (revoke-certificate (certificate-id uint))
+  (let
+    ((cert-data (get-certificate certificate-id))
+     (exam-data (match cert-data
+                  cert (get-exam (get exam-id cert))
+                  none)))
+    
+    (asserts! (is-some cert-data) ERR_CERTIFICATE_NOT_FOUND)
+    (asserts! (is-some exam-data) ERR_EXAM_NOT_FOUND)
+    (asserts! (not (get is-revoked (unwrap! cert-data ERR_CERTIFICATE_NOT_FOUND))) ERR_CERTIFICATE_REVOKED)
+    (asserts! (is-eq tx-sender (get creator (unwrap! exam-data ERR_EXAM_NOT_FOUND))) ERR_NOT_AUTHORIZED)
+    
+    (map-set certificates certificate-id
+      (merge (unwrap! cert-data ERR_CERTIFICATE_NOT_FOUND) {is-revoked: true}))
     (ok true)))
